@@ -5,3 +5,4 @@ displays values ​​from 0.000 to 3.300.
 Quartus Prime Lite Edition 25.1.
 FPGA Altera Cyclone EP4CE6E22C8.
 Ads1015  addr 90H pin addr connect to gnd.
+<img width="800" height="639" alt="FPGA Altera Cyclone IV EP4CE6 CH340" src="https://github.com/user-attachments/assets/7f40c281-bf22-4f10-8d45-2a76d3ac7511" />
