@@ -1,0 +1,159 @@
+`timescale 1ns / 1ps
+
+// =========================================================================
+// ГОЛОВНИЙ МОДУЛЬ КАСКАДНОГО ФІЛЬТРА (СЕРЕДНЄ 64 -> МЕДІАНА 21)
+// =========================================================================
+module cascade_filter (
+    input  logic        clk,            // Частота системи 50 МГц
+    input  logic        reset_n,        // Активний низький
+    input  logic        i_data_valid,   // Строб готовності від ads1015_poll (w_adc_ready)
+    input  logic [15:0] i_data,         // Сирі 16-бітні лівовирівняні дані АЦП (w_adc_val)
+    output logic        o_data_valid,   // Новий строб готовності для вашого моста (w_filtered_adc_ready)
+    output logic [15:0] o_data          // Очищені 16-бітні дані для вашого моста (w_filtered_adc_val)
+);
+
+    logic        w_avg_valid;
+    logic [15:0] w_avg_data;
+
+    // Крок 1: Скользяще середнє (64 елементи) - первинне потужне згладжування шуму
+    moving_average_64 u_average (
+        .clk          (clk),
+        .reset_n      (reset_n),
+        .i_data_valid (i_data_valid),
+        .i_data       (i_data),
+        .o_data_valid (w_avg_valid),
+        .o_average    (w_avg_data)
+    );
+
+    // Крок 2: Медіанний фільтр (21 елемент) - фінальне відсікання залишків викидів
+    median_filter_21 u_median (
+        .clk          (clk),
+        .reset_n      (reset_n),
+        .i_data_valid (w_avg_valid),   // Тактується стробом від усереднювача
+        .i_data       (w_avg_data),    // Приймає вже згладжені дані
+        .o_data_valid (o_data_valid),  // Фінальний вихід на міст
+        .o_median     (o_data)         // Фінальні очищені дані
+    );
+
+endmodule
+
+
+// =========================================================================
+// 1. ЗНАКОВИЙ ФІЛЬТР СКОЛЬЗЯЩОГО СЕРЕДНЬОГО НА 64 ЕЛЕМЕНТИ
+// =========================================================================
+module moving_average_64 (
+    input  logic        clk,
+    input  logic        reset_n,
+    input  logic        i_data_valid,
+    input  logic [15:0] i_data,
+    output logic        o_data_valid,
+    output logic [15:0] o_average
+);
+
+    localparam int N = 64;
+    localparam int SHIFT = 6; // log2(64) для ділення зсувом
+
+    // Буфери та суматори signed для коректної математики зі знаком
+    logic signed [15:0] delay_line[0:N-1];
+    logic signed [21:0] sum; // 16 біт даних + 6 біт розширення знаку під суму
+
+    always_ff @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            sum          <= 22'SD0;
+            o_average    <= 16'd0;
+            o_data_valid <= 1'b0;
+            for (int i = 0; i < N; i++) begin
+                delay_line[i] <= 16'SD0;
+            end
+        end else begin
+            o_data_valid <= 1'b0;
+
+            if (i_data_valid) begin
+                // Обчислення за CIC-формулою: Сума = Сума + Новий - Найстаріший
+                sum <= sum + signed'(i_data) - delay_line[N-1];
+
+                // Просування лінії затримки
+                for (int i = N-1; i > 0; i--) begin
+                    delay_line[i] <= delay_line[i-1];
+                end
+                delay_line <= signed'(i_data);
+
+                // Арифметичний зсув (>>>) для збереження знаку від'ємних кодів
+                o_average    <= logic'((sum + signed'(i_data) - delay_line[N-1]) >>> SHIFT);
+                o_data_valid <= 1'b1;
+            end
+        end
+    end
+endmodule
+
+
+// =========================================================================
+// 2. КОНВЕЄРНИЙ РАНГОВИЙ МЕДІАННИЙ ФІЛЬТР НА 21 ЕЛЕМЕНТ
+// =========================================================================
+module median_filter_21 (
+    input  logic        clk,
+    input  logic        reset_n,
+    input  logic        i_data_valid,
+    input  logic [15:0] i_data,
+    output logic        o_data_valid,
+    output logic [15:0] o_median
+);
+
+    localparam int N = 21;
+    localparam int MEDIAN_INDEX = 10; // Центр вікна для 21 точки
+
+    logic signed [15:0] shift_reg[0:N-1];
+    logic signed [15:0] sorted[0:N-1];
+    
+    // Регістри конвеєра для розвантаження Critical Path на 50 МГц
+    logic [4:0]  rank_matrix[0:N-1];
+    logic        pipe_valid;
+
+    always_ff @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            o_data_valid <= 1'b0;
+            o_median     <= 16'd0;
+            pipe_valid   <= 1'b0;
+            for (int i = 0; i < N; i++) begin
+                shift_reg[i]   <= 16'SD0;
+                sorted[i]      <= 16'SD0;
+                rank_matrix[i] <= 5'd0;
+            end
+        end else begin
+            o_data_valid <= 1'b0;
+            pipe_valid   <= 1'b0;
+
+            // ТАКТ 1: Запис згладжених даних у зсувний регістр та розрахунок рангів
+            if (i_data_valid) begin
+                for (int i = N-1; i > 0; i--) begin
+                    shift_reg[i] <= shift_reg[i-1];
+                end
+                shift_reg <= signed'(i_data);
+                
+                // Рангове паралельне сортування під залізо
+                for (int i = 0; i < N; i++) begin
+                    logic [4:0] r;
+                    r = 5'd0;
+                    for (int j = 0; j < N; j++) begin
+                        if (shift_reg[i] > shift_reg[j]) begin
+                            r++;
+                        end else if (shift_reg[i] == shift_reg[j] && i > j) begin
+                            r++; // Захист від однакових значень
+                        end
+                    end
+                    rank_matrix[i] <= r;
+                end
+                pipe_valid <= 1'b1;
+            end
+
+            // ТАКТ 2: Формування відсортованого масиву sorted та видача результату
+            if (pipe_valid) begin
+                for (int i = 0; i < N; i++) begin
+                    sorted[rank_matrix[i]] <= shift_reg[i];
+                end
+                o_median     <= logic'(sorted[MEDIAN_INDEX]); // Чиста фінальна медіана
+                o_data_valid <= 1'b1;
+            end
+        end
+    end
+endmodule

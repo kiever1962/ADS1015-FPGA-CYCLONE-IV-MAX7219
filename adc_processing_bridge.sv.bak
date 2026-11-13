@@ -1,0 +1,111 @@
+`timescale 1ns / 1ps
+
+module adc_processing_bridge (
+    input  logic        clk,
+    input  logic        reset_n,
+    
+    // Вхідний інтерфейс від автомата опитування АЦП
+    input  logic [15:0] s_adc_data,
+    input  logic        s_data_valid,
+    input  logic        s_i2c_ack_err,
+    
+    // Модифікований вихідний інтерфейс для вашого незмінного драйвера
+    output logic [15:0] m_adc_data,
+    output logic        m_data_valid,
+    output logic        m_i2c_ack_err
+);
+
+    logic [11:0] clean_adc_12bit;
+    logic [11:0] voltage_mv;
+    logic        bcd_start;
+    logic        bcd_ready;
+    
+    logic [3:0] bcd3_v, bcd2_h, bcd1_t, bcd0_m;
+
+    // Керуючий автомат координації обчислень
+    typedef enum logic [1:0] {ST_WAIT_ADC, ST_START_BCD, ST_WAIT_BCD, ST_OUT} t_bridge_state;
+    t_bridge_state state;
+
+    // Приєднуємо ваш послідовний BCD конвертер
+    bin_to_bcd_3300 u_bcd_calc (
+        .clk     (clk),
+        .reset_n (reset_n),
+        .bin_val (voltage_mv),
+        .start   (bcd_start),
+        .bcd3    (bcd3_v),  // Цілі Вольти
+        .bcd2    (bcd2_h),  // Сотні мілівольт (Десяті Вольт)
+        .bcd1    (bcd1_t),  // Десятки мілівольт (Соні Вольт)
+        .bcd0    (bcd0_m),  // Одиниці мілівольт (Тисячні Вольт) - відкидаємо для 3-х знаків
+        .ready   (bcd_ready)
+    );
+
+    // Прокидаємо прапорець помилки I2C транзитом
+    assign m_i2c_ack_err = s_i2c_ack_err;
+
+    always_ff @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            state        <= ST_WAIT_ADC;
+            voltage_mv   <= '0;
+            bcd_start    <= 1'b0;
+            m_adc_data   <= '0;
+            m_data_valid <= 1'b0;
+        end else begin
+            m_data_valid <= 1'b0;
+            bcd_start    <= 1'b0;
+
+            case (state)
+                ST_WAIT_ADC: begin
+                    if (s_data_valid) begin
+                        // 1. Прибираємо ліве вирівнювання ADS1015
+                        clean_adc_12bit = s_adc_data >> 4;
+                        
+                        // Перевіряємо знак (захист від ffb / мікро-мінуса)
+                        if (s_adc_data == 1'b1) begin
+                            voltage_mv <= 12'd0;
+                        end else begin
+                            // 2. Розрахунок мілівольт: Код * 2 мВ (автоматичне приведення типів)
+                            logic [12:0] temp_mv = {clean_adc_12bit, 1'b0}; // Швидке множення на 2 зсувом
+                            
+                            // 3. Обмежуємо верхню межу діапазоном живлення (3.3В = 3300 мВ)
+                            if (temp_mv > 13'd3300) begin
+                                voltage_mv <= 12'd3300;
+                            end else begin
+                                voltage_mv <= temp_mv[11:0];
+                            end
+                        end
+                        state <= ST_START_BCD;
+                    end
+                end
+
+                ST_START_BCD: begin
+                    bcd_start <= 1'b1; // Генеруємо строб запуску для bin_to_bcd
+                    state     <= ST_WAIT_BCD;
+                end
+
+                ST_WAIT_BCD: begin
+                    if (bcd_ready) begin
+                        // 4. Пакуємо BCD цифри у 16-бітне слово під ваш незмінний драйвер!
+                        // Нагадаємо бітові маски вашого read_data:
+                        // dig2_data (лівий)   = hex2seg(latch_in[7:4]);   -> сюди мають піти Десяті (bcd2_h)
+                        // dig1_data (середній) = hex2seg(latch_in[11:8]);  -> сюди мають піти Сотні (bcd1_t) - насправді це 2-й знак після коми
+                        // dig0_data (правий)  = hex2seg(latch_in[15:12]); -> сюди мають піти Цілі Вольти (bcd3_v)
+                        // Ніббл latch_in[3:0] вашим драйвером просто викидається.
+                        
+                        m_adc_data[3:0]   <= 4'h0;
+                        m_adc_data[7:4]   <= bcd2_h; // Потрапить на лівий індикатор (DIG2)
+                        m_adc_data[11:8]  <= bcd1_t; // Потрапить на середній індикатор (DIG1)
+                        m_adc_data[15:12] <= bcd3_v; // Потрапить на правий індикатор (DIG0)
+                        
+                        state <= ST_OUT;
+                    end
+                end
+
+                ST_OUT: begin
+                    m_data_valid <= 1'b1; // Передаємо строб готовності BCD вашому драйверу дисплея
+                    state        <= ST_WAIT_ADC;
+                end
+                default: state <= ST_WAIT_ADC;
+            endcase
+        end
+    end
+endmodule

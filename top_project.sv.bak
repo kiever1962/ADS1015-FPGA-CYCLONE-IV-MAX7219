@@ -1,0 +1,86 @@
+`timescale 1ns / 1ps
+
+module top_project (
+    input  logic        clk_50mhz,    // Вхідний тактовий сигнал 50 МГц з плати
+    input  logic        reset_n,      // Кнопка скидання (активний низький рівень)
+    
+    // Фізичні двонаправлені піни шини I2C для підключення ADS1015
+    inout  wire         scl,
+    inout  wire         sda,
+    
+    // Фізичні піни інтерфейсу SPI для модуля MAX7219
+    output logic        max7219_cs,
+    output logic        max7219_clk,
+    output logic        max7219_din
+);
+
+    // Внутрішні лінії зв'язку між ядрами
+    logic        w_ena;
+    logic [6:0]  w_addr;
+    logic        w_rw;
+    logic [7:0]  w_data_wr;
+    logic        w_busy;
+    logic [7:0]  w_data_rd;
+    logic        w_ack_err;
+    
+    logic [15:0] w_adc_val;   
+    logic        w_adc_ready;
+
+    // =========================================================================
+    // 1. Модуль фізичного рівня I2C Master (Scott Larson VHDL)
+    // =========================================================================
+    // Прокидаємо вхідні bidirectional 'wire' піни (scl, sda) ТАК ЯК Є 
+    // безпосередньо в портів VHDL-модуля. Quartus сам скомпілює open-drain буфери.
+    i2c_master #(
+        .input_clk (50_000_000),  // 50 MHz
+        .bus_clk   (100_000)      // 100 kHz Standard Mode
+    ) u_i2c_master (
+        .clk       (clk_50mhz),
+        .reset_n   (reset_n),
+        .ena       (w_ena),
+        .addr      (w_addr),
+        .rw        (w_rw),
+        .data_wr   (w_data_wr),
+        .busy      (w_busy),
+        .data_rd   (w_data_rd),
+        .ack_error (w_ack_err),
+        .sda       (sda),         // Пряме підключення до фізичного піна
+        .scl       (scl)          // Пряме підключення до фізичного піна
+    );
+
+    // =========================================================================
+    // 2. Конечний автомат періодичного циклічного опитування АЦП
+    // =========================================================================
+    ads1015_poll #(
+        .SYS_CLK_FRQ (50_000_000) 
+    ) u_ads1015_poll (
+        .clk         (clk_50mhz),
+        .reset_n     (reset_n),
+        .adc_data    (w_adc_val),
+        .data_valid  (w_adc_ready),
+        .i2c_ena     (w_ena),
+        .i2c_addr    (w_addr),
+        .i2c_rw      (w_rw),
+        .i2c_data_wr (w_data_wr),
+        .i2c_busy    (w_busy),
+        .i2c_data_rd (w_data_rd),
+        .i2c_ack_err (w_ack_err)
+    );
+
+    // =========================================================================
+    // 3. Драйвер дисплея MAX7219 
+    // =========================================================================
+    max7219_hex_driver #(
+        .SYS_CLK_FRQ (50_000_000) 
+    ) u_max7219_driver (
+        .clk        (clk_50mhz),
+        .reset_n    (reset_n),
+        .adc_data   (w_adc_val),    
+        .data_valid (w_adc_ready),  
+        .i2c_ack_err(w_ack_err),    
+        .max_cs     (max7219_cs),   
+        .max_clk    (max7219_clk),  
+        .max_din    (max7219_din)   
+    );
+
+endmodule

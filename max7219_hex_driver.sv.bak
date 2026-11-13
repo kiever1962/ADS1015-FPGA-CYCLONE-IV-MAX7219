@@ -1,0 +1,228 @@
+`timescale 1ns / 1ps
+
+module max7219_hex_driver #(
+    parameter int SYS_CLK_FRQ = 50_000_000 // Частота тактування системи (50 МГц)
+)(
+    input  logic        clk,          // Вхідна тактова частота системи 50 МГц
+    input  logic        reset_n,      // Сигнал скидання (активний низький)
+    
+    // Інтерфейс даних від автомата опитування АЦП
+    input  logic [15:0] adc_data,     // 16-бітні дані {MSB, LSB}
+    input  logic        data_valid,   // Строб готовності даних від ADS1015
+    input  logic        i2c_ack_err,  // Прапорець апаратної помилки I2C
+    
+    // Физичні виходи SPI на модуль MAX7219
+    output logic        max_cs,       // Вихід Latch / CS
+    output logic        max_clk,      // Вихід SPI Clock
+    output logic        max_din       // Вихід SPI Data
+);
+
+    // =========================================================================
+    // 1. ОГОЛОШЕННЯ ПОЛЬЗОВАТЕЛЬСЬКИХ ТИПІВ ДАННИХ
+    // =========================================================================
+    
+    // Стані головного автомата, оптимізовані під 3 активні розряди
+    typedef enum logic [3:0] {
+        init_1, init_2, init_3, init_4, init_5, 
+        idle_wait, read_data,
+        dig_2, dig_1, dig_0
+    } state_t;
+
+    // Стані апаратного SPI драйвера
+    typedef enum logic [2:0] {
+        idle, start, clk_data, clk_high, clk_low, finished
+    } driver_state_t;
+
+    // =========================================================================
+    // 2. ОГОЛОШЕННЯ ВНУТРЕННІХ СИГНАЛІВ І ПЕРЕМЕННИХ
+    // =========================================================================
+    state_t        state;
+    driver_state_t driver_state;
+    
+    logic [15:0] command;
+    logic [15:0] latch_in;
+    
+    // Використовуємо 3 байти для 3-х активних індикаторів
+    logic [7:0]  dig0_data, dig1_data, dig2_data;
+    
+    int counter;
+    int clk_counter;
+
+    // =========================================================================
+    // 3. ЗНАКОГЕНЕРАТОР HEX В 7-СЕГМЕНТНИЙ КОД (Common Cathode)
+    // =========================================================================
+    function automatic logic [7:0] hex2seg (input logic [3:0] num);
+        case (num)
+            4'h0: return 8'b01111110;
+            4'h1: return 8'b00110000;
+            4'h2: return 8'b01101101;
+            4'h3: return 8'b01111001;
+            4'h4: return 8'b00110011;
+            4'h5: return 8'b01011011;
+            4'h6: return 8'b01011111;
+            4'h7: return 8'b01110000;
+            4'h8: return 8'b01111111;
+            4'h9: return 8'b01111011;
+            4'hA: return 8'b01110111;
+            4'hb: return 8'b00011111;
+            4'hc: return 8'b00001101;
+            4'hd: return 8'b00111101;
+            4'hE: return 8'b01001111;
+            4'hF: return 8'b01000111;
+            default: return 8'b00000000;
+        endcase
+    endfunction
+
+    // =========================================================================
+    // 4. ОСНОВНИЙ СИНХРОННИЙ АВТОМАТ ОБРАБОТКИ
+    // =========================================================================
+    always_ff @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            state        <= init_1;
+            driver_state <= idle;
+            command      <= 16'h0000;
+            latch_in     <= 16'h0000;
+            dig0_data    <= 8'h00;
+            dig1_data    <= 8'h00;
+            dig2_data    <= 8'h00;
+            counter      <= 0;
+            clk_counter  <= 0;
+            max_cs       <= 1'b1;
+            max_clk      <= 1'b0;
+            max_din      <= 1'b0;
+        end else begin
+            
+            case (state)
+                init_1: begin
+                    if (driver_state == idle) begin
+                        command      <= 16'h0f00; // Вимкнення Display Test
+                        driver_state <= start;
+                        state        <= init_2;
+                    end
+                end
+                init_2: begin
+                    if (driver_state == idle) begin
+                        command      <= 16'h0c01; // Shutdown / Normal operation
+                        driver_state <= start;
+                        state        <= init_3;
+                    end
+                end
+                init_3: begin
+                    if (driver_state == idle) begin
+                        command      <= 16'h0900; // Decode mode: No decode
+                        driver_state <= start;
+                        state        <= init_4;
+                    end
+                end
+                init_4: begin
+                    if (driver_state == idle) begin
+                        command      <= 16'h0A02; // Intensity: Середня яскравість
+                        driver_state <= start;
+                        state        <= init_5;
+                    end
+                end
+                init_5: begin
+                    if (driver_state == idle) begin
+                        // Scan limit = 16'h0B02 — залишаємо 3 знаки (0, 1, 2)
+                        command      <= 16'h0B02; 
+                        driver_state <= start;
+                        state        <= idle_wait;
+                    end
+                end
+
+                // Очікування нового стробу готовності від АЦП
+                idle_wait: begin
+                    if (data_valid) begin
+                        state <= read_data;
+                    end
+                end
+
+                read_data: begin
+                    if (i2c_ack_err) begin
+                        // Аварійний режим I2C: пишемо "Err" на трьох знаках
+                        dig2_data = 8'b01001111; // "E"
+                        dig1_data = 8'b00000101; // "r"
+                        dig0_data = 8'b00000101; // "r"
+                    end else begin
+                        latch_in  = adc_data;
+                        
+                        // НАЛАШТУВАННЯ ПІД ДІАПАЗОН 000 - 7FF З ВИПРАВЛЕННЯМ ДЗЕРКАЛЬНОСТІ:
+                        // Повністю викидаємо неробочий нульовий молодший ніббл latch_in[3:0].
+                        // Корисні дані лежать у розрядах [15:12], [11:8], [7:4].
+                        // Міняємо місцями крайні цифри, щоб скоригувати розводку плати індикатора:
+                        dig2_data = hex2seg(latch_in[7:4]);   // Лівий активний знак (отримує третій ніббл)
+                        dig1_data = hex2seg(latch_in[11:8]);  // Середній знак (другий ніббл)
+                        dig0_data = hex2seg(latch_in[15:12]); // Правий активний знак (отримує старший ніббл)
+                    end
+                    state <= dig_2;
+                end
+
+                // Оновлюємо послідовно 3 фізичні регістри індикаторів MAX7219
+                dig_2: begin
+                    if (driver_state == idle) begin
+                        command      <= {8'h01, dig2_data}; // Запис у перший індикатор (Digit 1)
+                        driver_state <= start;
+                        state        <= dig_1;
+                    end
+                end
+                dig_1: begin
+                    if (driver_state == idle) begin
+                        command      <= {8'h02, dig1_data}; // Другий індикатор (Digit 2)
+                        driver_state <= start;
+                        state        <= dig_0;
+                    end
+                end
+                dig_0: begin
+                    if (driver_state == idle) begin
+                        command      <= {8'h03, dig0_data}; // Третій індикатор (Digit 3)
+                        driver_state <= start;
+                        state        <= idle_wait;          // Повернення в очікування нового стробу
+                    end
+                end
+                default: state <= init_1;
+            endcase
+
+            // Сітка тактування SPI шини: 500 кГц
+            if (clk_counter < 100) begin
+                clk_counter <= clk_counter + 1;
+            end else begin
+                clk_counter <= 0;
+                
+                case (driver_state)
+                    idle: begin
+                        max_cs  <= 1'b1;
+                        max_clk <= 1'b0;
+                    end
+                    start: begin
+                        max_cs       <= 1'b0;
+                        counter      <= 16;
+                        driver_state <= clk_data;
+                    end
+                    clk_data: begin
+                        counter      <= counter - 1;
+                        max_din      <= command[counter - 1]; // Побітова видача
+                        driver_state <= clk_high;
+                    end
+                    clk_high: begin // ТУТ ВИПРАВЛЕНО: тепер назва стану повністю збігається з enum
+                        max_clk      <= 1'b1;
+                        driver_state <= clk_low;
+                    end
+                    clk_low: begin
+                        max_clk <= 1'b0;
+                        if (counter == 0) begin
+                            max_cs       <= 1'b1;
+                            driver_state <= finished;
+                        end else begin
+                            driver_state <= clk_data;
+                        end
+                    end
+                    finished: begin
+                        driver_state <= idle;
+                    end
+                    default: driver_state <= idle;
+                endcase
+            end
+        end
+    end
+
+endmodule
