@@ -2,7 +2,7 @@
 
 module top_project (
     input  logic        clk_50mhz,    // Вхідний тактовий сигнал 50 МГц з плати
-    input  logic        reset_n,      // Кнопка скидання (активний низький рівень)
+    input  logic        reset_n,      // Кнопка скидання (активний низький уровень)
     
     // Фізичні двонаправлені піни шини I2C для підключення ADS1015
     inout  wire         scl,
@@ -15,19 +15,21 @@ module top_project (
 );
 
     // =========================================================================
-    // ГЕНЕРАТОР ВНУТРІШНЬОГО POWER-UP RESET (ЗАХИСТ СТАРТУ З FLASH)
+    // ГЕНЕРАТОР НАДІЙНОГО ВНУТРІШНЬОГО POWER-UP RESET
     // =========================================================================
-    logic [20:0] r_power_up_cnt = '0;
-    logic        w_internal_reset_n = 1'b0;
+    // Зсувний регістр ініціалізується нулями апаратно при старті.
+    // Навіть якщо залізо вмикається у випадковому стані, послідовний зсув одиниць
+    // через такт clk_50mhz забезпечує чистий і синхронний старт усіх блоків.
+    logic [7:0] r_reset_reg = 8'h00; 
+    logic       w_internal_reset_n;
 
     always_ff @(posedge clk_50mhz) begin
-        if (r_power_up_cnt < 21'h1FFFFF) begin // Утримуємо скидання ~41 мс при старті
-            r_power_up_cnt     <= r_power_up_cnt + 1;
-            w_internal_reset_n <= 1'b0;
-        end else begin
-            w_internal_reset_n <= reset_n; // Далі працює звичайна кнопка на платі
-        end
+        // Зсуваємо одиниці, якщо фізична кнопка reset_n відпущена (дорівнює 1)
+        r_reset_reg <= {r_reset_reg[6:0], reset_n};
     end
+    
+    // Скидання відпуститься (стане 1) тільки після заповнення всього регістру
+    assign w_internal_reset_n = &r_reset_reg;
 
     // =========================================================================
     // ОГОЛОШЕННЯ ВНУТРІШНІХ ЛІНІЙ ЗВ'ЯЗКУ
@@ -49,16 +51,15 @@ module top_project (
     logic [15:0] w_processed_bcd;
     logic        w_processed_ready;
     logic        w_processed_ack_err;
-
     // =========================================================================
-    // 1. МОДУЛЬ ФІЗИЧНОГО РІВНЯ I2C MASTER (Scott Larson VHDL)
+    // 1. МОДУЛЬ ФІЗИЧНОГО РІВНЯ I2C MASTER (НАЗВА i2c_master_sv)
     // =========================================================================
-    i2c_master #(
+    i2c_master_sv #(
         .input_clk (50_000_000),  
-        .bus_clk   (100_000)      
+        .bus_clk   (400_000)      
     ) u_i2c_master (
         .clk       (clk_50mhz), 
-        .reset_n   (w_internal_reset_n), // Підключено внутрішнє скидання
+        .reset_n   (w_internal_reset_n), // Надійне подовжене скидання
         .ena       (w_ena), 
         .addr      (w_addr), 
         .rw        (w_rw),
@@ -77,7 +78,7 @@ module top_project (
         .SYS_CLK_FRQ (50_000_000) 
     ) u_ads1015_poll (
         .clk         (clk_50mhz), 
-        .reset_n     (w_internal_reset_n), // Підключено внутрішнє скидання
+        .reset_n     (w_internal_reset_n), 
         .adc_data    (w_adc_val),       
         .data_valid  (w_adc_ready),     
         .i2c_ena     (w_ena), 
@@ -90,24 +91,23 @@ module top_project (
     );
 
     // =========================================================================
-    // 2.2. БЛОК КАСКАДНОГО ЦИФРОВИГО ФІЛЬТРА (Середнє 64 -> Медіана 5)
+    // 2.2. БЛОК КАСКАДНОГО ЦИФРОВИГО ФІЛЬТРА
     // =========================================================================
     cascade_filter u_cascade_filter (
         .clk          (clk_50mhz),
-        .reset_n      (w_internal_reset_n), // КРИТИЧНО: Має бути внутрішнє довге скидання!
+        .reset_n      (w_internal_reset_n), 
         .i_data_valid (w_adc_ready),          
         .i_data       (w_adc_val),            
         .o_data_valid (w_filtered_adc_ready), 
         .o_data       (w_filtered_adc_val)   
     );
 
-
     // =========================================================================
-    // 2.5. ПРОМІЖНИЙ ОБЧИСЛЮВАЛЬНИЙ МІСТ (Керування Double Dabble)
+    // 2.5. ПРОМІЖНИЙ ОБЧИСЛЮВАЛЬНИЙ МІСТ (Double Dabble)
     // =========================================================================
     adc_processing_bridge u_processing_bridge (
         .clk           (clk_50mhz),
-        .reset_n       (w_internal_reset_n), // Підключено внутрішнє скидання
+        .reset_n       (w_internal_reset_n), 
         
         .s_adc_data    (w_filtered_adc_val),   
         .s_data_valid  (w_filtered_adc_ready),
@@ -125,7 +125,7 @@ module top_project (
         .SYS_CLK_FRQ (50_000_000) 
     ) u_max7219_driver (
         .clk         (clk_50mhz),
-        .reset_n     (w_internal_reset_n), // Підключено внутрішнє скидання
+        .reset_n     (w_internal_reset_n), 
         .adc_data    (w_processed_bcd),       
         .data_valid  (w_processed_ready),  
         .i2c_ack_err (w_processed_ack_err),    

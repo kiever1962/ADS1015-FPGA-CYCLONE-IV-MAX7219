@@ -25,9 +25,9 @@ module ads1015_poll #(
     localparam logic [7:0] CONFIG_MSB = 8'hD3; 
     localparam logic [7:0] CONFIG_LSB = 8'h84; 
 
-    localparam int INIT_DELAY_CYCLES   = (SYS_CLK_FRQ / 500);  
-    localparam int CONFIG_DELAY_CYCLES = (SYS_CLK_FRQ / 1000); 
-    localparam int LOOP_PAUSE_CYCLES   = (SYS_CLK_FRQ / 50);   
+    localparam int INIT_DELAY_CYCLES   = (SYS_CLK_FRQ / 500);   // 500
+    localparam int CONFIG_DELAY_CYCLES = (SYS_CLK_FRQ / 30000); // 1000
+    localparam int LOOP_PAUSE_CYCLES   = (SYS_CLK_FRQ / 50);    // 50  
 
     typedef enum logic [2:0] {
         ST_RESET,          
@@ -227,13 +227,29 @@ module ads1015_poll #(
                                 sub_cnt <= 3;
                             end
                         end
-
+/*
                         3: begin 
                             if (busy_falling_edge) begin
                                 if (i2c_ack_err) begin
                                     state <= ST_RESET;
                                 end else begin
                                     adc_data    <= {msb_buffer, i2c_data_rd}; 
+                                    data_valid  <= 1'b1; 
+                                    sub_cnt     <= 4;
+                                end
+                            end
+                        end
+*/
+                        3: begin 
+                            if (busy_falling_edge) begin
+                                if (i2c_ack_err) begin
+                                    state <= ST_RESET;
+                                end else begin
+                                    // 1. Інтерпретуємо зчитане слово як знакове ($signed)
+                                    // 2. Якщо воно менше 0 (знаковий біт = 1), записуємо чистий нуль
+                                    // 3. Якщо додатне, записуємо "сирі" дані, зберігаючи ліве вирівнювання для мосту
+                                    adc_data    <= ($signed({msb_buffer, i2c_data_rd}) < 0) ? 16'h0000 : 
+                                                   {msb_buffer, i2c_data_rd}; 
                                     data_valid  <= 1'b1; 
                                     sub_cnt     <= 4;
                                 end

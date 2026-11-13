@@ -1,0 +1,289 @@
+`timescale 1ns / 1ps
+
+module i2c_master_sv #(
+    parameter int input_clk = 50_000_000, // Входная частота системного клока в Гц
+    parameter int bus_clk   = 100_000     // Скорость шины I2C (SCL) в Гц (для АЦП ставьте 400_000)
+)(
+    input  logic        clk,        // Системный тактовый сигнал
+    input  logic        reset_n,    // Асинхронный сброс (активный 0)
+    input  logic        ena,        // Сигнал старта/продолжения транзакции
+    input  logic [6:0]  addr,       // 7-битный адрес ведомого (ADS1015)
+    input  logic        rw,         // '0' - запись, '1' - чтение
+    input  logic [7:0]  data_wr,    // Байт для записи
+    
+    output logic        busy,       // Флаг: транзакция в процессе выполнения
+    output logic [7:0]  data_rd,    // Выходной байт, считанный с ведомого
+    output logic        ack_error,  // Ошибка подтверждения ACK (активный 1)
+    
+    // Двунаправленные линии шины I2C (физические пины FPGA)
+    inout  wire         sda,        
+    inout  wire         scl         
+);
+
+    // Вычисление количества системных тактов в 1/4 цикла SCL
+    localparam int divider = (input_clk / bus_clk) / 4;
+
+    // Перечисление для автомата состояний
+    typedef enum logic [3:0] {
+        ST_READY,
+        ST_START,
+        ST_COMMAND,
+        ST_SLV_ACK1,
+        ST_WR,
+        ST_RD,
+        ST_SLV_ACK2,
+        ST_MSTR_ACK,
+        ST_STOP
+    } state_t;
+
+    state_t state;
+
+    // Внутренние сигналы генератора частоты
+    logic data_clk;
+    logic data_clk_prev;
+    logic scl_clk;
+    logic scl_ena = 1'b0;
+    logic sda_int = 1'b1;
+    logic sda_ena_n;
+    
+    // Внутренние буферы данных
+    logic [7:0] addr_rw;
+    logic [7:0] data_tx;
+    logic [7:0] data_rx;
+    int   bit_cnt = 7;
+    logic stretch = 1'b0;
+    
+    wire data_clk_m;
+
+    //----------------------------------------------------------------------
+    // 1. ГЕНЕРАТОР ТАЙМИНГОВ ДЛЯ ШИНЫ (SCL_CLK И DATA_CLK)
+    //----------------------------------------------------------------------
+    int count; // Переменная таймера
+
+    always_ff @(posedge clk or megedge reset_n) begin
+        if (!reset_n) begin
+            stretch       <= 1'b0;
+            count         <= 0;
+            data_clk_prev <= 1'b0;
+            scl_clk       <= 1'b0;
+            data_clk      <= 1'b0;
+        end else begin
+            data_clk_prev <= data_clk; // Сохраняем предыдущее состояние data_clk
+            
+            if (count == (divider * 4) - 1) begin
+                count <= 0; // Сброс таймера в конце цикла
+            end else if (!stretch) begin
+                count <= count + 1; // Если ведомый не тянет SCL вниз, считаем дальше
+            end
+
+            // Формирование четвертей периода
+            if (count >= 0 && count < divider) begin
+                scl_clk  <= 1'b0;
+                data_clk <= 1'b0;
+            end else if (count >= divider && count < divider * 2) begin
+                scl_clk  <= 1'b0;
+                data_clk <= 1'b1;
+            end else if (count >= divider * 2 && count < divider * 3) begin
+                scl_clk <= 1'b1; // Отпускаем линию SCL
+                // Проверяем Clock Stretching
+                if (scl == 1'b0) begin
+                    stretch <= 1'b1;
+                end else begin
+                    stretch <= 1'b0;
+                end
+                data_clk <= 1'b1;
+            end else begin
+                scl_clk  <= 1'b1;
+                data_clk <= 1'b0;
+            end
+        end
+    end
+    //----------------------------------------------------------------------
+    // 2. ГЛАВНЫЙ АВТОМАТ СОСТОЯНИЙ И ЗАПИСЬ В SDA (ПО ФРОНТУ DATA_CLK)
+    //----------------------------------------------------------------------
+    always_ff @(posedge clk or negedge reset_n) begin
+        if (!reset_n) begin
+            state     <= ST_READY;
+            busy      <= 1'b1;
+            scl_ena   <= 1'b0;
+            sda_int   <= 1'b1;
+            ack_error <= 1'b0;
+            bit_cnt   <= 7;
+            data_rd   <= 8'h00;
+            data_rx   <= 8'h00;
+            addr_rw   <= 8'h00;
+            data_tx   <= 8'h00;
+        end else begin
+            // Срабатывание по фронту data_clk
+            if (data_clk == 1'b1 && data_clk_prev == 1'b0) begin
+                case (state)
+                    ST_READY: begin
+                        if (ena == 1'b1) begin
+                            busy    <= 1'b1;
+                            addr_rw <= {addr, rw}; // Объединяем адрес и бит R/W
+                            data_tx <= data_wr;    // Фиксируем байт для записи
+                            state   <= ST_START;
+                        end else begin
+                            busy  <= 1'b0; // Шина свободна
+                            state <= ST_READY;
+                        end
+                    end
+
+                    ST_START: begin
+                        busy    <= 1'b1;
+                        sda_int <= addr_rw[bit_cnt]; // Выставляем первый бит адреса
+                        state   <= ST_COMMAND;
+                    end
+
+                    ST_COMMAND: begin
+                        if (bit_cnt == 0) begin
+                            sda_int <= 1'b1; // Отпускаем SDA для приема ACK
+                            bit_cnt <= 7;    // Сбрасываем счетчик для следующих байт
+                            state   <= ST_SLV_ACK1;
+                        end else begin
+                            bit_cnt <= bit_cnt - 1;
+                            sda_int <= addr_rw[bit_cnt - 1];
+                            state   <= ST_COMMAND;
+                        end
+                    end
+
+                    ST_SLV_ACK1: begin
+                        if (addr_rw[0] == 1'b0) begin // Если была команда на ЗАПИСЬ (rw='0')
+                            sda_int <= data_tx[bit_cnt]; // Выставляем первый бит данных
+                            state   <= ST_WR;
+                        end else begin // Если была команда на ЧТЕНИЕ (rw='1')
+                            state   <= ST_RD;
+                        end
+                    end
+
+                    ST_WR: begin
+                        busy <= 1'b1;
+                        if (bit_cnt == 0) begin
+                            sda_int <= 1'b1; // Отпускаем SDA для приема ACK
+                            bit_cnt <= 7;
+                            state   <= ST_SLV_ACK2;
+                        end else begin
+                            bit_cnt <= bit_cnt - 1;
+                            sda_int <= data_tx[bit_cnt - 1];
+                            state   <= ST_WR;
+                        end
+                    end
+
+                    ST_RD: begin
+                        busy <= 1'b1;
+                        if (bit_cnt == 0) begin
+                            // Если продолжаем чтение по тому же адресу
+                            if (ena == 1'b1 && addr_rw == {addr, rw}) begin
+                                sda_int <= 1'b0; // Посылаем ACK ведомому
+                            end else begin
+                                sda_int <= 1'b1; // Посылаем NACK (завершаем чтение)
+                            end
+                            bit_cnt <= 7;
+                            data_rd <= data_rx; // Выводим считанный байт наружу
+                            state   <= ST_MSTR_ACK;
+                        end else begin
+                            bit_cnt <= bit_cnt - 1;
+                            state   <= ST_RD;
+                        end
+                    end
+
+                    ST_SLV_ACK2: begin
+                        if (ena == 1'b1) begin // Если нужно продолжить запись
+                            addr_rw <= {addr, rw};
+                            data_tx <= data_wr;
+                            if (addr_rw == {addr, rw}) begin // Продолжение записи
+                                busy    <= 1'b1;
+                                sda_int <= data_wr[bit_cnt];
+                                state   <= ST_WR;
+                            end else begin 
+                                state   <= ST_START; // Повторный старт (Repeated Start)
+                            end
+                        end else begin
+                            state <= ST_STOP; // Завершение транзакции
+                        end
+                    end
+
+                    ST_MSTR_ACK: begin
+                        if (ena == 1'b1) begin
+                            busy    <= 1'b0; // Сигнализируем готовность данных на шине data_rd
+                            addr_rw <= {addr, rw};
+                            data_tx <= data_wr;
+                            if (addr_rw == {addr, rw}) begin // Продолжаем чтение
+                                sda_int <= 1'b1;
+                                state   <= ST_RD;
+                            end else begin
+                                state   <= ST_START; // Повторный старт
+                            end
+                        end else begin
+                            state <= ST_STOP;
+                        end
+                    end
+
+                    ST_STOP: begin
+                        busy  <= 1'b0; // Транзакция полностью завершена
+                        state <= ST_READY;
+                    end
+                    
+                    default: state <= ST_READY;
+                endcase
+            end
+            
+            //----------------------------------------------------------------------
+            // 3. ЧТЕНИЕ ИЗ SDA И ОШИБКИ ACK (ПО СПАДУ DATA_CLK)
+            //----------------------------------------------------------------------
+            else if (data_clk == 1'b0 && data_clk_prev == 1'b1) begin
+                case (state)
+                    ST_START: begin
+                        if (!scl_ena) begin
+                            scl_ena   <= 1'b1; // Разрешаем выдачу SCL наружу
+                            ack_error <= 1'b0; // Сбрасываем прошлую ошибку
+                        end
+                    end
+                    
+                    ST_SLV_ACK1: begin
+                        // Если ведомый не прижал SDA к нулю — фиксируем ошибку ACK
+                        if (sda != 1'b0 || ack_error == 1'b1) begin
+                            ack_error <= 1'b1;
+                        end
+                    end
+                    
+                    ST_RD: begin
+                        data_rx[bit_cnt] <= sda; // Записываем бит с физической линии SDA
+                    end
+                    
+                    ST_SLV_ACK2: begin
+                        if (sda != 1'b0 || ack_error == 1'b1) begin
+                            ack_error <= 1'b1;
+                        end
+                    end
+                    
+                    ST_STOP: begin
+                        scl_ena <= 1'b0; // Отключаем тактирование SCL
+                    end
+                    
+                    default: ; 
+                endcase
+            end
+        end
+    end
+
+    //----------------------------------------------------------------------
+    // 4. ФОРМИРОВАНИЕ ВЫХОДНЫХ ДВУНАПРАВЛЕННЫХ ЛИНИЙ (TRISTATE BUFFER)
+    //----------------------------------------------------------------------
+    assign data_clk_m = data_clk_prev && data_clk;
+
+    // Комбинационная логика выбора источника управления линией SDA
+    always_comb begin
+        case (state)
+            ST_START: sda_ena_n = data_clk;        // Формирование условия СТАРТ
+            ST_STOP:  sda_ena_n = !data_clk_m;     // Формирование условия СТОП
+            default:  sda_ena_n = sda_int;         // Выдача внутреннего регистра данных
+        endcase
+    end
+
+    // Физический вывод на открытый коллектор: выдаем '0' или 'Z' (высокое сопротивление).
+    // Линии подтягиваются к '1' внешними резисторами Pull-up на плате.
+    assign scl = (scl_ena && !scl_clk) ? 1'b0 : 1'bz;
+    assign sda = (!sda_ena_n)          ? 1'b0 : 1'bz;
+
+endmodule
